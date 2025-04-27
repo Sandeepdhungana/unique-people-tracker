@@ -9,7 +9,7 @@ import torchvision
 from torchvision.models.detection import fasterrcnn_resnet50_fpn_v2
 from torchvision.transforms import functional as F
 import os
-
+# main
 def main():
     # Parse command line arguments
     parser = argparse.ArgumentParser(description="Person tracking with Re-ID demo")
