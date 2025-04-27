@@ -164,6 +164,60 @@ class DeepPersonReID:
         # Simple placeholder for pose features
         return np.array([aspect_ratio, width, height])
     
+    def extract_clothing_features(self, image, box):
+        """
+        Extract clothing-specific features from a person detection
+        This separates the person into regions (upper body, lower body) and extracts detailed features
+        """
+        x1, y1, x2, y2 = box
+        x1, y1, x2, y2 = int(x1), int(y1), int(x2), int(y2)
+        
+        # Ensure coordinates are within image boundaries
+        x1, y1 = max(0, x1), max(0, y1)
+        x2, y2 = min(image.shape[1], x2), min(image.shape[0], y2)
+        
+        if x2 <= x1 or y2 <= y1 or (x2-x1)*(y2-y1) < 100:  # Skip tiny or invalid boxes
+            return np.zeros(256)  # Return zeros for clothing features
+            
+        # Crop person from image
+        person_img = image[y1:y2, x1:x2]
+        
+        # Convert from BGR to RGB 
+        person_img = cv2.cvtColor(person_img, cv2.COLOR_BGR2RGB)
+        
+        # Divide the person into upper and lower body
+        height, width = person_img.shape[:2]
+        upper_body = person_img[:int(height * 0.5), :]  # Upper 50%
+        lower_body = person_img[int(height * 0.5):, :]  # Lower 50%
+        
+        # Extract color histograms for both parts (more bins for better discrimination)
+        def extract_color_hist(img):
+            if img.size == 0:
+                return np.zeros(128)
+                
+            # Extract histogram in HSV space for better color representation
+            img_hsv = cv2.cvtColor(img, cv2.COLOR_RGB2HSV)
+            
+            # Calculate histograms with more bins for better discrimination
+            h_hist = cv2.calcHist([img_hsv], [0], None, [16], [0, 180])
+            s_hist = cv2.calcHist([img_hsv], [1], None, [16], [0, 256])
+            v_hist = cv2.calcHist([img_hsv], [2], None, [8], [0, 256])
+            
+            # Normalize histograms
+            h_hist = cv2.normalize(h_hist, h_hist).flatten()
+            s_hist = cv2.normalize(s_hist, s_hist).flatten()
+            v_hist = cv2.normalize(v_hist, v_hist).flatten()
+            
+            # Concatenate
+            return np.concatenate([h_hist, s_hist, v_hist])
+            
+        # Extract histograms for upper and lower body
+        upper_hist = extract_color_hist(upper_body)
+        lower_hist = extract_color_hist(lower_body)
+        
+        # Combine features (128 features per body part = 256 total)
+        return np.concatenate([upper_hist, lower_hist])
+    
     def update_trajectory(self, tracker_id, box):
         """Update trajectory information for a person"""
         if tracker_id not in self.recent_trajectories:
@@ -240,10 +294,16 @@ class DeepPersonReID:
         return similarity_sum / len(dir1)
     
     def calculate_combined_similarity(self, appearance1, pose1, height1, trajectory1, position1,
-                                      appearance2, pose2, height2, trajectory2, position2):
+                                      appearance2, pose2, height2, trajectory2, position2,
+                                      clothing1=None, clothing2=None):
         """Calculate overall similarity between two persons using multiple features"""
         # Appearance similarity (deep features)
         appearance_sim = cosine_similarity([appearance1], [appearance2])[0][0]
+        
+        # Clothing similarity (if available)
+        clothing_sim = 0
+        if clothing1 is not None and clothing2 is not None:
+            clothing_sim = cosine_similarity([clothing1], [clothing2])[0][0]
         
         # Pose similarity
         if pose1 is not None and pose2 is not None:
@@ -269,8 +329,13 @@ class DeepPersonReID:
             spatial_sim = max(0, 1 - dist / max_dist)
         
         # Combined similarity with weights
+        # Add clothing features with weight of 0.2 (reduce appearance weight to compensate)
+        appearance_weight = self.appearance_weight * 0.8
+        clothing_weight = 0.2
+        
         combined_sim = (
-            self.appearance_weight * appearance_sim +
+            appearance_weight * appearance_sim +
+            clothing_weight * clothing_sim +
             self.pose_weight * pose_sim + 
             self.height_weight * height_sim
         )
@@ -369,6 +434,7 @@ class DeepPersonReID:
             # Extract features
             deep_features = self.extract_deep_features(image, xyxy)
             pose_features = self.extract_pose_features(image, xyxy)
+            clothing_features = self.extract_clothing_features(image, xyxy)
             
             # Update trajectory
             self.update_trajectory(tracker_id, xyxy)
@@ -393,7 +459,8 @@ class DeepPersonReID:
                     'height': (1-alpha) * old_features['height'] + alpha * height,
                     'last_seen': 0,  # Frame counter since last seen
                     'trajectory': trajectory,
-                    'quality': min(1.0, old_features.get('quality', 0.5) + 0.01)  # Safely access quality with a default
+                    'quality': min(1.0, old_features.get('quality', 0.5) + 0.01),  # Safely access quality with a default
+                    'clothing': (1-alpha) * old_features['clothing'] + alpha * clothing_features
                 }
                 
                 self.person_features[persistent_id] = updated_features
@@ -422,7 +489,8 @@ class DeepPersonReID:
                     similarity = self.calculate_combined_similarity(
                         deep_features, pose_features, height, trajectory, current_pos,
                         p_features['appearance'], p_features['pose'], 
-                        p_features['height'], p_features['trajectory'], predicted_pos
+                        p_features['height'], p_features['trajectory'], predicted_pos,
+                        clothing_features, p_features.get('clothing')
                     )
                     
                     # Adjust similarity based on how long the person has been gone
@@ -468,7 +536,8 @@ class DeepPersonReID:
                         'height': (1-alpha) * old_features['height'] + alpha * height,
                         'last_seen': 0,  # Reset frame counter
                         'trajectory': trajectory,
-                        'quality': old_features.get('quality', 0.5)  # Safely access quality with default
+                        'quality': old_features.get('quality', 0.5),  # Safely access quality with default
+                        'clothing': (1-alpha) * old_features['clothing'] + alpha * clothing_features
                     }
                     
                     self.person_features[persistent_id] = updated_features
@@ -477,8 +546,21 @@ class DeepPersonReID:
                     print(f"Re-identified person {persistent_id} with similarity {best_similarity:.2f}")
                 else:
                     # Create a new persistent ID
-                    persistent_id = self.next_persistent_id
-                    self.next_persistent_id += 1
+                    
+                    # First try to match with permanent features database
+                    permanent_match, match_sim = self.match_with_permanent_features(
+                        deep_features, clothing_features, height)
+                    
+                    if permanent_match is not None:
+                        # Use the permanent ID
+                        persistent_id = permanent_match
+                        print(f"Using permanent ID {persistent_id} for new person (sim: {match_sim:.2f})")
+                    else:
+                        # Create a new ID
+                        persistent_id = self.next_persistent_id
+                        self.next_persistent_id += 1
+                        print(f"New person detected with ID {persistent_id}")
+                    
                     current_p_ids.add(persistent_id)
                     
                     # Store all features
@@ -488,12 +570,11 @@ class DeepPersonReID:
                         'height': height,
                         'last_seen': 0,
                         'trajectory': trajectory,
-                        'quality': 0.5  # Initial quality rating (medium confidence)
+                        'quality': 0.5,  # Initial quality rating (medium confidence)
+                        'clothing': clothing_features
                     }
                     
                     self.last_positions[persistent_id] = current_pos
-                    
-                    print(f"New person detected with ID {persistent_id}")
                 
                 # Map tracker_id to persistent_id
                 self.id_mapping[tracker_id] = persistent_id
@@ -549,6 +630,9 @@ class DeepPersonReID:
                 'current_frame': self.current_frame
             }, f)
         print(f"Saved {len(self.person_features)} person profiles to {filename}")
+        
+        # Also save to permanent database for future video sessions
+        self.save_permanent_features()
     
     def load_features(self, filename="deep_person_features.pkl"):
         """Load person features from file"""
@@ -608,4 +692,95 @@ class DeepPersonReID:
             # Add quality field if missing
             if 'quality' not in features:
                 features['quality'] = 0.5
-                print(f"Upgraded features for person {pid}: added quality field") 
+                print(f"Upgraded features for person {pid}: added quality field")
+            
+            # Add clothing features if missing
+            if 'clothing' not in features:
+                # Create a default clothing feature vector
+                features['clothing'] = np.zeros(256)  # 256-dimensional clothing features
+                print(f"Upgraded features for person {pid}: added clothing field")
+    
+    def save_permanent_features(self, filename="permanent_person_features.pkl"):
+        """
+        Save high-quality person features to a permanent database that persists across videos
+        Only saves persons with high feature quality (confidence)
+        """
+        # Filter for high-quality features only (persons that have been tracked reliably)
+        permanent_features = {}
+        for p_id, features in self.person_features.items():
+            # Only keep persons with good quality tracking history (0.7+ quality)
+            if features.get('quality', 0) >= 0.7:
+                # Store a copy of the features
+                permanent_features[p_id] = {
+                    'appearance': features['appearance'].copy(),
+                    'clothing': features['clothing'].copy(),
+                    'height': features['height'],
+                    # Don't save temporary data like trajectory and last_seen
+                }
+        
+        # Create directory if it doesn't exist
+        os.makedirs(os.path.dirname(os.path.abspath(filename)) or '.', exist_ok=True)
+        
+        # Load existing database if it exists, to merge with new features
+        existing_features = {}
+        if os.path.exists(filename):
+            try:
+                with open(filename, 'rb') as f:
+                    existing_features = pickle.load(f)
+            except Exception as e:
+                print(f"Error loading permanent features: {e}")
+        
+        # Merge new features with existing ones
+        existing_features.update(permanent_features)
+        
+        # Save merged features
+        with open(filename, 'wb') as f:
+            pickle.dump(existing_features, f)
+            
+        print(f"Saved {len(permanent_features)} high-quality person profiles to permanent database")
+        print(f"Permanent database now contains {len(existing_features)} unique people")
+    
+    def match_with_permanent_features(self, deep_features, clothing_features, height):
+        """
+        Try to match a person with permanent features from previous videos
+        Returns best matching ID or None if no good match
+        """
+        best_match_id = None
+        best_similarity = 0
+        
+        # Path to permanent features database
+        permanent_db = "permanent_person_features.pkl"
+        
+        if not os.path.exists(permanent_db):
+            return None
+        
+        try:
+            # Load permanent features database
+            with open(permanent_db, 'rb') as f:
+                permanent_features = pickle.load(f)
+                
+            # Try to match with each person in the database
+            for p_id, features in permanent_features.items():
+                # Calculate similarity between current person and stored person
+                appearance_sim = cosine_similarity([deep_features], [features['appearance']])[0][0]
+                clothing_sim = cosine_similarity([clothing_features], [features['clothing']])[0][0]
+                
+                # Height similarity
+                height_diff = abs(height - features['height']) / max(height, features['height'])
+                height_sim = 1 - min(1.0, height_diff)
+                
+                # Combined similarity
+                similarity = 0.5 * appearance_sim + 0.3 * clothing_sim + 0.2 * height_sim
+                
+                if similarity > best_similarity and similarity > 0.75:  # Higher threshold for permanent matches
+                    best_similarity = similarity
+                    best_match_id = p_id
+                    
+            if best_match_id is not None:
+                print(f"Matched with permanent ID {best_match_id} (sim: {best_similarity:.2f})")
+                return best_match_id, best_similarity
+                
+        except Exception as e:
+            print(f"Error matching with permanent features: {e}")
+            
+        return None, 0 
