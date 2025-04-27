@@ -752,7 +752,7 @@ class DeepPersonReID:
         permanent_db = "permanent_person_features.pkl"
         
         if not os.path.exists(permanent_db):
-            return None
+            return None, 0  # Return tuple with None and 0 similarity
         
         try:
             # Load permanent features database
@@ -783,4 +783,4 @@ class DeepPersonReID:
         except Exception as e:
             print(f"Error matching with permanent features: {e}")
             
-        return None, 0 
+        return None, 0  # Return tuple with None and 0 similarity 
