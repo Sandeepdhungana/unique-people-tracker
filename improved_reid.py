@@ -57,6 +57,10 @@ class DeepPersonReID:
         self.last_known_features = {}  # Cache features for better occlusion handling
         self.occlusion_counter = {}  # Count how many frames an ID has been in occlusion
         
+        # Special cache for people who leave the frame completely
+        self.exited_people_cache = {}  # Store high-quality features for people who exit the frame
+        self.exit_feature_quality_threshold = 0.7  # Only cache high quality features for exited people
+        
         # Set up device
         try:
             # First check if CUDA is available
@@ -439,6 +443,9 @@ class DeepPersonReID:
             
         updated_tracker_ids = updated_detections.tracker_id.copy()
         
+        # Get previously visible IDs to detect people who have left the frame
+        previous_visible_ids = set(self.id_mapping.values())
+        
         # Current frame's persistent IDs - used to track who's visible
         current_p_ids = set()
         
@@ -559,72 +566,27 @@ class DeepPersonReID:
                     
                     print(f"Recovered from in-screen occlusion: {persistent_id} (sim: {occlusion_sim:.2f})")
                 else:
-                    # Standard matching for non-occlusion cases
-                    best_match_id = None
-                    best_similarity = 0
+                    # Next, try to match with people who completely left the frame
+                    exit_match, exit_sim = self.match_with_exited_cache(
+                        deep_features, clothing_features, height)
                     
-                    # Consider only IDs not currently tracked (not in id_mapping values)
-                    untracked_ids = [p_id for p_id in self.person_features.keys() 
-                                     if p_id not in current_p_ids]
-                    
-                    for p_id in untracked_ids:
-                        p_features = self.person_features[p_id]
-                        
-                        # Predict current position based on last known position and velocity
-                        predicted_pos = self.predict_position(p_id, p_features['last_seen'])
-                        
-                        # Calculate similarity between current person and stored person
-                        similarity = self.calculate_combined_similarity(
-                            deep_features, pose_features, height, trajectory, current_pos,
-                            p_features['appearance'], p_features['pose'], 
-                            p_features['height'], p_features['trajectory'], predicted_pos,
-                            clothing_features, p_features.get('clothing')
-                        )
-                        
-                        # Adjust similarity based on how long the person has been gone
-                        # More lenient decay to help with reidentification after longer absences
-                        frames_gone = p_features['last_seen']
-                        
-                        # Use a more forgiving time factor for brief occlusions
-                        if frames_gone < 10:  # Brief occlusion
-                            time_factor = 0.95  # Almost no penalty for very brief occlusions
-                        else:
-                            time_factor = max(0.2, 1 - (frames_gone / self.feature_memory_frames))
-                        
-                        # Also consider feature quality - more tracked frames = higher confidence
-                        quality_factor = p_features.get('quality', 0.5)  # Safely access with default value
-                        
-                        adjusted_similarity = similarity * time_factor * quality_factor
-                        
-                        if adjusted_similarity > best_similarity:
-                            best_similarity = adjusted_similarity
-                            best_match_id = p_id
-                    
-                    # Lower threshold for brief occlusions
-                    actual_threshold = self.similarity_threshold
-                    if best_match_id is not None:
-                        frames_gone = self.person_features[best_match_id]['last_seen']
-                        if frames_gone < 10:  # Brief occlusion
-                            # Use lower threshold for brief occlusions
-                            actual_threshold = max(0.3, self.similarity_threshold - 0.2)
-                    
-                    # If similarity is above threshold, consider it the same person
-                    if best_match_id is not None and best_similarity > actual_threshold:
-                        persistent_id = best_match_id
+                    if exit_match is not None:
+                        # Found a match with someone who left the frame
+                        persistent_id = exit_match
                         current_p_ids.add(persistent_id)
                         
-                        # Update features with running average
+                        # Update features (lower weight for exited person recovery)
                         old_features = self.person_features[persistent_id]
-                        alpha = 0.3  # Lower weight for re-identified persons
+                        alpha = 0.2  # Lower weight
                         
                         # Update features
                         updated_features = {
                             'appearance': (1-alpha) * old_features['appearance'] + alpha * deep_features,
-                            'pose': pose_features,  # Just replace pose
+                            'pose': pose_features,
                             'height': (1-alpha) * old_features['height'] + alpha * height,
-                            'last_seen': 0,  # Reset frame counter
+                            'last_seen': 0,
                             'trajectory': trajectory,
-                            'quality': old_features.get('quality', 0.5),  # Safely access quality with default
+                            'quality': old_features.get('quality', 0.5),
                             'clothing': (1-alpha) * old_features['clothing'] + alpha * clothing_features
                         }
                         
@@ -634,36 +596,113 @@ class DeepPersonReID:
                         # Update trajectory with persistent ID
                         self.update_trajectory(tracker_id, xyxy, persistent_id)
                         
-                        print(f"Re-identified person {persistent_id} with similarity {best_similarity:.2f}")
+                        print(f"Matched with person who left frame: {persistent_id} (sim: {exit_sim:.2f})")
                     else:
-                        # First try to match with permanent features database
-                        permanent_match, match_sim = self.match_with_permanent_features(
-                            deep_features, clothing_features, height)
+                        # Standard matching for non-occlusion cases
+                        best_match_id = None
+                        best_similarity = 0
                         
-                        if permanent_match is not None:
-                            # Use the permanent ID
-                            persistent_id = permanent_match
-                            print(f"Using permanent ID {persistent_id} for new person (sim: {match_sim:.2f})")
+                        # Consider only IDs not currently tracked (not in id_mapping values)
+                        untracked_ids = [p_id for p_id in self.person_features.keys() 
+                                        if p_id not in current_p_ids]
+                        
+                        for p_id in untracked_ids:
+                            p_features = self.person_features[p_id]
+                            
+                            # Predict current position based on last known position and velocity
+                            predicted_pos = self.predict_position(p_id, p_features['last_seen'])
+                            
+                            # Calculate similarity between current person and stored person
+                            similarity = self.calculate_combined_similarity(
+                                deep_features, pose_features, height, trajectory, current_pos,
+                                p_features['appearance'], p_features['pose'], 
+                                p_features['height'], p_features['trajectory'], predicted_pos,
+                                clothing_features, p_features.get('clothing')
+                            )
+                            
+                            # Adjust similarity based on how long the person has been gone
+                            # More lenient decay to help with reidentification after longer absences
+                            frames_gone = p_features['last_seen']
+                            
+                            # Use a more forgiving time factor for brief occlusions
+                            if frames_gone < 10:  # Brief occlusion
+                                time_factor = 0.95  # Almost no penalty for very brief occlusions
+                            else:
+                                time_factor = max(0.2, 1 - (frames_gone / self.feature_memory_frames))
+                            
+                            # Also consider feature quality - more tracked frames = higher confidence
+                            quality_factor = p_features.get('quality', 0.5)  # Safely access with default value
+                            
+                            adjusted_similarity = similarity * time_factor * quality_factor
+                            
+                            if adjusted_similarity > best_similarity:
+                                best_similarity = adjusted_similarity
+                                best_match_id = p_id
+                        
+                        # Lower threshold for brief occlusions
+                        actual_threshold = self.similarity_threshold
+                        if best_match_id is not None:
+                            frames_gone = self.person_features[best_match_id]['last_seen']
+                            if frames_gone < 10:  # Brief occlusion
+                                # Use lower threshold for brief occlusions
+                                actual_threshold = max(0.3, self.similarity_threshold - 0.2)
+                        
+                        # If similarity is above threshold, consider it the same person
+                        if best_match_id is not None and best_similarity > actual_threshold:
+                            persistent_id = best_match_id
+                            current_p_ids.add(persistent_id)
+                            
+                            # Update features with running average
+                            old_features = self.person_features[persistent_id]
+                            alpha = 0.3  # Lower weight for re-identified persons
+                            
+                            # Update features
+                            updated_features = {
+                                'appearance': (1-alpha) * old_features['appearance'] + alpha * deep_features,
+                                'pose': pose_features,  # Just replace pose
+                                'height': (1-alpha) * old_features['height'] + alpha * height,
+                                'last_seen': 0,  # Reset frame counter
+                                'trajectory': trajectory,
+                                'quality': old_features.get('quality', 0.5),  # Safely access quality with default
+                                'clothing': (1-alpha) * old_features['clothing'] + alpha * clothing_features
+                            }
+                            
+                            self.person_features[persistent_id] = updated_features
+                            self.last_positions[persistent_id] = current_pos
+                            
+                            # Update trajectory with persistent ID
+                            self.update_trajectory(tracker_id, xyxy, persistent_id)
+                            
+                            print(f"Re-identified person {persistent_id} with similarity {best_similarity:.2f}")
                         else:
-                            # Create a new ID
-                            persistent_id = self.next_persistent_id
-                            self.next_persistent_id += 1
-                            print(f"New person detected with ID {persistent_id}")
-                        
-                        current_p_ids.add(persistent_id)
-                        
-                        # Store all features
-                        self.person_features[persistent_id] = {
-                            'appearance': deep_features,
-                            'pose': pose_features,
-                            'height': height,
-                            'last_seen': 0,
-                            'trajectory': trajectory,
-                            'quality': 0.5,  # Initial quality rating (medium confidence)
-                            'clothing': clothing_features
-                        }
-                        
-                        self.last_positions[persistent_id] = current_pos
+                            # First try to match with permanent features database
+                            permanent_match, match_sim = self.match_with_permanent_features(
+                                deep_features, clothing_features, height)
+                            
+                            if permanent_match is not None:
+                                # Use the permanent ID
+                                persistent_id = permanent_match
+                                print(f"Using permanent ID {persistent_id} for new person (sim: {match_sim:.2f})")
+                            else:
+                                # Create a new ID
+                                persistent_id = self.next_persistent_id
+                                self.next_persistent_id += 1
+                                print(f"New person detected with ID {persistent_id}")
+                            
+                            current_p_ids.add(persistent_id)
+                            
+                            # Store all features
+                            self.person_features[persistent_id] = {
+                                'appearance': deep_features,
+                                'pose': pose_features,
+                                'height': height,
+                                'last_seen': 0,
+                                'trajectory': trajectory,
+                                'quality': 0.5,  # Initial quality rating (medium confidence)
+                                'clothing': clothing_features
+                            }
+                            
+                            self.last_positions[persistent_id] = current_pos
                 
                 # Map tracker_id to persistent_id
                 self.id_mapping[tracker_id] = persistent_id
@@ -673,7 +712,19 @@ class DeepPersonReID:
             # Update detection with persistent ID
             updated_tracker_ids[i] = self.id_mapping[tracker_id]
         
-        # Increment last_seen counter for persons not in current frame
+        # Check for people who left the frame
+        for p_id in previous_visible_ids:
+            if p_id not in current_p_ids:
+                # This person was visible before but is not in this frame
+                if p_id in self.person_features:
+                    # Increment their "last seen" counter
+                    self.person_features[p_id]['last_seen'] += 1
+                    
+                    # If they just left (last_seen = 1), cache their features
+                    if self.person_features[p_id]['last_seen'] == 5:  # After 5 frames, consider them "left"
+                        self.cache_exited_person(p_id)
+        
+        # Increment last_seen counter for all other persons not in frame
         for p_id in self.person_features:
             if p_id not in current_p_ids:
                 self.person_features[p_id]['last_seen'] += 1
@@ -716,7 +767,8 @@ class DeepPersonReID:
                 'velocity_vectors': self.velocity_vectors,
                 'recent_tracker_ids': self.recent_tracker_ids,
                 'last_seen_frame': self.last_seen_frame,
-                'current_frame': self.current_frame
+                'current_frame': self.current_frame,
+                'exited_people_cache': self.exited_people_cache
             }, f)
         print(f"Saved {len(self.person_features)} person profiles to {filename}")
         
@@ -751,10 +803,15 @@ class DeepPersonReID:
                             self.last_seen_frame = data.get('last_seen_frame', {})
                             self.current_frame = data.get('current_frame', 0)
                             
+                            # Load exited people cache if available
+                            self.exited_people_cache = data.get('exited_people_cache', {})
+                            
                             # Upgrade existing features if they're missing new fields
                             self._upgrade_loaded_features()
                             
                             print(f"Loaded {len(self.person_features)} person profiles from {filename}")
+                            if self.exited_people_cache:
+                                print(f"Loaded {len(self.exited_people_cache)} cached profiles of people who left frame")
                         else:
                             print(f"Feature dimensions mismatch: expected {self.feature_dim}, got {feature_dim}")
                             print("Starting with empty features due to model change")
@@ -969,3 +1026,72 @@ class DeepPersonReID:
         for p_id in list(self.occlusion_counter.keys()):
             if p_id not in self.person_features or self.person_features[p_id]['last_seen'] > 30:
                 del self.occlusion_counter[p_id] 
+    
+    def cache_exited_person(self, p_id):
+        """
+        Cache high-quality features for a person who has left the frame
+        This helps with better re-identification when they return
+        """
+        if p_id not in self.person_features:
+            return
+            
+        # Only cache high-quality features
+        if self.person_features[p_id].get('quality', 0) >= self.exit_feature_quality_threshold:
+            # Store a deep copy of key features
+            self.exited_people_cache[p_id] = {
+                'appearance': self.person_features[p_id]['appearance'].copy(),
+                'clothing': self.person_features[p_id]['clothing'].copy(),
+                'height': self.person_features[p_id]['height'],
+                'timestamp': self.current_frame  # When they exited
+            }
+            print(f"Cached high-quality features for exited person {p_id}")
+    
+    def match_with_exited_cache(self, deep_features, clothing_features, height):
+        """
+        Try to match a person with the cached features of people who left the frame
+        Uses multiple feature matching for better accuracy
+        """
+        best_match_id = None
+        best_similarity = 0
+        
+        for p_id, features in self.exited_people_cache.items():
+            # Skip if this ID is currently tracked
+            if p_id in self.id_mapping.values():
+                continue
+                
+            # Skip if we don't have this ID in person_features anymore (was cleaned up)
+            if p_id not in self.person_features:
+                continue
+                
+            # Calculate similarity based on appearance features
+            appearance_sim = cosine_similarity([deep_features], [features['appearance']])[0][0]
+            
+            # Calculate similarity based on clothing features (very important for people who left and returned)
+            clothing_sim = cosine_similarity([clothing_features], [features['clothing']])[0][0]
+            
+            # Calculate height similarity
+            height_diff = abs(height - features['height']) / max(height, features['height'])
+            height_sim = 1 - min(1.0, height_diff)
+            
+            # Combined similarity (higher weight on clothing which doesn't change when person leaves frame)
+            similarity = 0.3 * appearance_sim + 0.6 * clothing_sim + 0.1 * height_sim
+            
+            # Check how long ago they exited (give higher weight to recently exited people)
+            frames_gone = self.current_frame - features['timestamp']
+            time_factor = max(0.7, 1 - (frames_gone / (self.feature_memory_frames * 2)))
+            
+            # Apply time factor
+            adjusted_similarity = similarity * time_factor
+            
+            if adjusted_similarity > best_similarity:
+                best_similarity = adjusted_similarity
+                best_match_id = p_id
+                
+        # Use a lower threshold for exited people matching to improve recall
+        exit_threshold = 0.65  # Higher than occlusion but lower than regular matching
+        
+        if best_match_id is not None and best_similarity >= exit_threshold:
+            print(f"Matched with exited person {best_match_id} (sim: {best_similarity:.2f})")
+            return best_match_id, best_similarity
+            
+        return None, 0 
