@@ -351,7 +351,7 @@ class DeepPersonReID:
                     'height': (1-alpha) * old_features['height'] + alpha * height,
                     'last_seen': 0,  # Frame counter since last seen
                     'trajectory': trajectory,
-                    'quality': min(1.0, old_features['quality'] + 0.01)  # Slowly improve quality the longer we track
+                    'quality': min(1.0, old_features.get('quality', 0.5) + 0.01)  # Safely access quality with a default
                 }
                 
                 self.person_features[persistent_id] = updated_features
@@ -386,7 +386,7 @@ class DeepPersonReID:
                     time_factor = max(0.2, 1 - (frames_gone / self.feature_memory_frames))
                     
                     # Also consider feature quality - more tracked frames = higher confidence
-                    quality_factor = p_features.get('quality', 0.5)
+                    quality_factor = p_features.get('quality', 0.5)  # Safely access with default value
                     
                     adjusted_similarity = similarity * time_factor * quality_factor
                     
@@ -410,7 +410,7 @@ class DeepPersonReID:
                         'height': (1-alpha) * old_features['height'] + alpha * height,
                         'last_seen': 0,  # Reset frame counter
                         'trajectory': trajectory,
-                        'quality': old_features.get('quality', 0.5)  # Maintain quality rating
+                        'quality': old_features.get('quality', 0.5)  # Safely access quality with default
                     }
                     
                     self.person_features[persistent_id] = updated_features
@@ -502,6 +502,9 @@ class DeepPersonReID:
                             self.last_positions = data.get('last_positions', {})
                             self.velocity_vectors = data.get('velocity_vectors', {})
                             
+                            # Upgrade existing features if they're missing new fields
+                            self._upgrade_loaded_features()
+                            
                             print(f"Loaded {len(self.person_features)} person profiles from {filename}")
                         else:
                             print(f"Feature dimensions mismatch: expected {self.feature_dim}, got {feature_dim}")
@@ -521,4 +524,12 @@ class DeepPersonReID:
                 print("Starting with empty features")
                 self.person_features = {}
                 self.id_mapping = {}
-                self.next_persistent_id = 1 
+                self.next_persistent_id = 1
+                
+    def _upgrade_loaded_features(self):
+        """Add missing fields to loaded feature dictionaries to ensure compatibility with newer versions"""
+        for pid, features in self.person_features.items():
+            # Add quality field if missing
+            if 'quality' not in features:
+                features['quality'] = 0.5
+                print(f"Upgraded features for person {pid}: added quality field") 
