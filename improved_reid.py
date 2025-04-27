@@ -35,7 +35,7 @@ class DeepPersonReID:
         self.max_trajectory_length = 30  # Number of frames to keep trajectory history
         
         # Set up device
-        self.device = torch.device('cuda' if torch.cuda.is_available() and use_gpu else 'cpu')
+        self.device = torch.device('cuda')
         print(f"Using device: {self.device}")
         
         # Initialize Deep feature extraction model (using ResNet50 instead of OSNet)
