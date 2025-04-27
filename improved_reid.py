@@ -72,12 +72,23 @@ class DeepPersonReID:
         weights = ViT_B_16_Weights.DEFAULT
         vit_model = vit_b_16(weights=weights)
         
-        # Remove the classification head to get features
-        self.model = torch.nn.Sequential(
-            vit_model.conv_proj, 
-            vit_model.encoder,
-            # Skip the classification head
-        )
+        # Create a feature extractor by removing the classifier head
+        class VitFeatureExtractor(torch.nn.Module):
+            def __init__(self, vit_model):
+                super().__init__()
+                self.conv_proj = vit_model.conv_proj
+                self.encoder = vit_model.encoder
+                
+            def forward(self, x):
+                # Initial patch embedding
+                x = self.conv_proj(x)
+                # Process with encoder
+                x = self.encoder(x)
+                # Extract feature map - we're just using the sequence of patch embeddings
+                # and ignoring the class token at position 0
+                return x[:, 1:].permute(0, 2, 1).reshape(x.shape[0], -1, 14, 14)
+        
+        self.model = VitFeatureExtractor(vit_model)
         
         # Move model to device and set to evaluation mode
         self.model = self.model.to(self.device).eval()
@@ -114,16 +125,15 @@ class DeepPersonReID:
                     with torch.no_grad():
                         # Run through the model
                         output = self.model(tensor)
-                        # Get the [CLS] token which contains the image representation
-                        # For ViT, output[1] corresponds to the class token (CLS) output
-                        # We extract features from the CLS token 
-                        features = output[1]  # Shape: [batch_size, hidden_dim]
+                        # For ViT, the output is a feature map of shape [batch_size, channels, height, width]
+                        # We'll use global average pooling to get a 768-dim feature vector
+                        features = torch.nn.functional.adaptive_avg_pool2d(output, (1, 1)).squeeze(-1).squeeze(-1)
                 else:
                     # Already using CPU
                     tensor = tensor.to(self.device)
                     with torch.no_grad():
                         output = self.model(tensor)
-                        features = output[1]
+                        features = torch.nn.functional.adaptive_avg_pool2d(output, (1, 1)).squeeze(-1).squeeze(-1)
             except RuntimeError as e:
                 if "CUDA" in str(e):
                     print(f"CUDA error during inference, falling back to CPU: {e}")
@@ -133,7 +143,7 @@ class DeepPersonReID:
                     tensor = tensor.to(self.device)
                     with torch.no_grad():
                         output = self.model(tensor)
-                        features = output[1]
+                        features = torch.nn.functional.adaptive_avg_pool2d(output, (1, 1)).squeeze(-1).squeeze(-1)
                 else:
                     raise e
                 
