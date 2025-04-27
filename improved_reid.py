@@ -42,6 +42,12 @@ class DeepPersonReID:
         self.last_positions = {}  # Store last known positions of each persistent ID
         self.velocity_vectors = {}  # Store velocity vectors for better prediction during occlusion
         
+        # Short-term memory for handling brief occlusions (tracker_id: last_persistent_id)
+        self.recent_tracker_ids = {}  # Recently seen tracker IDs and their persistent IDs
+        self.short_term_memory = 10  # Frames to remember disappeared tracker IDs
+        self.last_seen_frame = {}  # Last frame where each tracker ID was seen
+        self.current_frame = 0  # Frame counter
+        
         # Set up device
         try:
             # First check if CUDA is available
@@ -303,6 +309,9 @@ class DeepPersonReID:
         Update person re-identification with new detections
         Returns updated detections with persistent IDs
         """
+        # Increment frame counter
+        self.current_frame += 1
+        
         # Create a copy of the detections
         updated_detections = detections
         
@@ -314,11 +323,44 @@ class DeepPersonReID:
         # Current frame's persistent IDs - used to track who's visible
         current_p_ids = set()
         
+        # First pass: check for short-term occlusions and direct matches
         for i, (xyxy, tracker_id, confidence, class_id) in enumerate(
             zip(updated_detections.xyxy, updated_detections.tracker_id, 
                 updated_detections.confidence, updated_detections.class_id)):
             
             if tracker_id is None or class_id != 0:  # Skip if not a person or no tracker ID
+                continue
+                
+            # Try to match with recently disappeared tracker IDs first (for short occlusions)
+            if tracker_id in self.recent_tracker_ids:
+                # This is a reappearing tracker ID we've seen recently
+                persistent_id = self.recent_tracker_ids[tracker_id]
+                # Check if this persistent ID is already assigned to another tracker in this frame
+                if persistent_id not in current_p_ids:
+                    # We can reuse the previous persistent ID
+                    self.id_mapping[tracker_id] = persistent_id
+                    updated_tracker_ids[i] = persistent_id
+                    current_p_ids.add(persistent_id)
+                    print(f"Recovered tracker ID {tracker_id} -> person {persistent_id} after short occlusion")
+                    # Update the last seen frame for this tracker ID
+                    self.last_seen_frame[tracker_id] = self.current_frame
+                    continue
+            
+            # Update the last seen frame for all current tracker IDs
+            self.last_seen_frame[tracker_id] = self.current_frame
+            
+            # Rest of the processing will happen in the second pass
+        
+        # Second pass: process remaining detections with feature matching
+        for i, (xyxy, tracker_id, confidence, class_id) in enumerate(
+            zip(updated_detections.xyxy, updated_detections.tracker_id, 
+                updated_detections.confidence, updated_detections.class_id)):
+            
+            if tracker_id is None or class_id != 0:  # Skip if not a person or no tracker ID
+                continue
+                
+            # Skip if already processed in the first pass
+            if tracker_id in self.id_mapping and self.id_mapping[tracker_id] in current_p_ids:
                 continue
                 
             # Calculate person height
@@ -358,6 +400,9 @@ class DeepPersonReID:
                 
                 # Update position tracking
                 self.last_positions[persistent_id] = current_pos
+                
+                # Add to recent tracker IDs memory
+                self.recent_tracker_ids[tracker_id] = persistent_id
             else:
                 # New tracker_id, check if it matches any known person who left the frame
                 best_match_id = None
@@ -365,7 +410,7 @@ class DeepPersonReID:
                 
                 # Consider only IDs not currently tracked (not in id_mapping values)
                 untracked_ids = [p_id for p_id in self.person_features.keys() 
-                                 if p_id not in self.id_mapping.values()]
+                                 if p_id not in current_p_ids]
                 
                 for p_id in untracked_ids:
                     p_features = self.person_features[p_id]
@@ -383,7 +428,12 @@ class DeepPersonReID:
                     # Adjust similarity based on how long the person has been gone
                     # More lenient decay to help with reidentification after longer absences
                     frames_gone = p_features['last_seen']
-                    time_factor = max(0.2, 1 - (frames_gone / self.feature_memory_frames))
+                    
+                    # Use a more forgiving time factor for brief occlusions
+                    if frames_gone < 10:  # Brief occlusion
+                        time_factor = 0.95  # Almost no penalty for very brief occlusions
+                    else:
+                        time_factor = max(0.2, 1 - (frames_gone / self.feature_memory_frames))
                     
                     # Also consider feature quality - more tracked frames = higher confidence
                     quality_factor = p_features.get('quality', 0.5)  # Safely access with default value
@@ -394,8 +444,16 @@ class DeepPersonReID:
                         best_similarity = adjusted_similarity
                         best_match_id = p_id
                 
+                # Lower threshold for brief occlusions
+                actual_threshold = self.similarity_threshold
+                if best_match_id is not None:
+                    frames_gone = self.person_features[best_match_id]['last_seen']
+                    if frames_gone < 10:  # Brief occlusion
+                        # Use lower threshold for brief occlusions
+                        actual_threshold = max(0.3, self.similarity_threshold - 0.2)
+                
                 # If similarity is above threshold, consider it the same person
-                if best_match_id is not None and best_similarity > self.similarity_threshold:
+                if best_match_id is not None and best_similarity > actual_threshold:
                     persistent_id = best_match_id
                     current_p_ids.add(persistent_id)
                     
@@ -439,6 +497,8 @@ class DeepPersonReID:
                 
                 # Map tracker_id to persistent_id
                 self.id_mapping[tracker_id] = persistent_id
+                # Add to recent tracker IDs memory
+                self.recent_tracker_ids[tracker_id] = persistent_id
             
             # Update detection with persistent ID
             updated_tracker_ids[i] = self.id_mapping[tracker_id]
@@ -447,6 +507,14 @@ class DeepPersonReID:
         for p_id in self.person_features:
             if p_id not in current_p_ids:
                 self.person_features[p_id]['last_seen'] += 1
+        
+        # Clean up old tracker IDs from short-term memory
+        for t_id in list(self.last_seen_frame.keys()):
+            frames_gone = self.current_frame - self.last_seen_frame[t_id]
+            if frames_gone > self.short_term_memory:
+                if t_id in self.recent_tracker_ids:
+                    del self.recent_tracker_ids[t_id]
+                del self.last_seen_frame[t_id]
         
         # Remove tracker IDs that are no longer tracked
         current_tracker_ids = set(updated_detections.tracker_id)
@@ -475,7 +543,10 @@ class DeepPersonReID:
                 'id_mapping': self.id_mapping,
                 'next_persistent_id': self.next_persistent_id,
                 'last_positions': self.last_positions,
-                'velocity_vectors': self.velocity_vectors
+                'velocity_vectors': self.velocity_vectors,
+                'recent_tracker_ids': self.recent_tracker_ids,
+                'last_seen_frame': self.last_seen_frame,
+                'current_frame': self.current_frame
             }, f)
         print(f"Saved {len(self.person_features)} person profiles to {filename}")
     
@@ -501,6 +572,11 @@ class DeepPersonReID:
                             # Load position and velocity data if available
                             self.last_positions = data.get('last_positions', {})
                             self.velocity_vectors = data.get('velocity_vectors', {})
+                            
+                            # Load short-term memory tracking data if available
+                            self.recent_tracker_ids = data.get('recent_tracker_ids', {})
+                            self.last_seen_frame = data.get('last_seen_frame', {})
+                            self.current_frame = data.get('current_frame', 0)
                             
                             # Upgrade existing features if they're missing new fields
                             self._upgrade_loaded_features()
