@@ -6,7 +6,7 @@ import pickle
 from sklearn.metrics.pairwise import cosine_similarity
 import torchvision
 from torchvision import transforms
-from torchvision.models import resnet50, ResNet50_Weights
+from torchvision.models import vit_b_16, ViT_B_16_Weights
 
 class DeepPersonReID:
     def __init__(self, 
@@ -33,38 +33,58 @@ class DeepPersonReID:
         self.next_persistent_id = 1
         self.recent_trajectories = {}  # Store recent positions for trajectory analysis
         self.max_trajectory_length = 30  # Number of frames to keep trajectory history
+        self.feature_dim = 768  # ViT-B/16 outputs 768-dim features
         
         # Set up device
-        self.device = torch.device('cuda')
+        try:
+            # First check if CUDA is available
+            if torch.cuda.is_available() and use_gpu:
+                # Try a small tensor operation to verify CUDA works correctly
+                test_tensor = torch.zeros(1, device='cuda')
+                _ = test_tensor + 1  # Simple operation to test CUDA
+                self.device = torch.device('cuda')
+                print(f"Using GPU: {torch.cuda.get_device_name()}")
+            else:
+                self.device = torch.device('cpu')
+                print("CUDA not available, using CPU")
+        except Exception as e:
+            print(f"CUDA error: {e}")
+            print("Falling back to CPU")
+            self.device = torch.device('cpu')
+            
         print(f"Using device: {self.device}")
         
-        # Initialize Deep feature extraction model (using ResNet50 instead of OSNet)
+        # Initialize Deep feature extraction model (using Vision Transformer)
         self.setup_model()
         
         # Initialize image transformations
         self.transform = transforms.Compose([
             transforms.ToPILImage(),
-            transforms.Resize((256, 128)),  # Standard size for person ReID
+            transforms.Resize((224, 224)),  # ViT expects 224x224 images
             transforms.ToTensor(),
             transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225])
         ])
         
     def setup_model(self):
         """Initialize the deep learning model for feature extraction"""
-        print("Setting up ResNet50 model for feature extraction...")
-        # Use ResNet50 with pretrained weights
-        weights = ResNet50_Weights.DEFAULT
-        self.model = resnet50(weights=weights)
+        print("Setting up Vision Transformer (ViT-B/16) model for feature extraction...")
+        # Use the latest ViT model
+        weights = ViT_B_16_Weights.DEFAULT
+        vit_model = vit_b_16(weights=weights)
         
-        # Remove the classification layer to get features
-        self.model = torch.nn.Sequential(*list(self.model.children())[:-1])
+        # Remove the classification head to get features
+        self.model = torch.nn.Sequential(
+            vit_model.conv_proj, 
+            vit_model.encoder,
+            # Skip the classification head
+        )
         
         # Move model to device and set to evaluation mode
         self.model = self.model.to(self.device).eval()
         print("Model initialized successfully")
 
     def extract_deep_features(self, image, box):
-        """Extract deep features from person crop using ReID model"""
+        """Extract deep features from person crop using ViT model"""
         x1, y1, x2, y2 = box
         x1, y1, x2, y2 = int(x1), int(y1), int(x2), int(y2)
         
@@ -73,7 +93,7 @@ class DeepPersonReID:
         x2, y2 = min(image.shape[1], x2), min(image.shape[0], y2)
         
         if x2 <= x1 or y2 <= y1 or (x2-x1)*(y2-y1) < 100:  # Skip tiny or invalid boxes
-            return np.zeros(512)  # Return zeros with expected feature dimension
+            return np.zeros(self.feature_dim)  # ViT outputs 768-dimensional features
             
         # Crop person from image
         person_img = image[y1:y2, x1:x2]
@@ -83,17 +103,45 @@ class DeepPersonReID:
         
         # Apply transformations
         try:
-            tensor = self.transform(person_img).unsqueeze(0).to(self.device)
+            tensor = self.transform(person_img).unsqueeze(0)
             
-            # Extract features
-            with torch.no_grad():
-                features = self.model(tensor)
+            # Handle CUDA errors by falling back to CPU if needed
+            try:
+                if self.device.type == 'cuda':
+                    tensor = tensor.to(self.device)
+                    
+                    # Extract features
+                    with torch.no_grad():
+                        # Run through the model
+                        output = self.model(tensor)
+                        # Get the [CLS] token which contains the image representation
+                        # For ViT, output[1] corresponds to the class token (CLS) output
+                        # We extract features from the CLS token 
+                        features = output[1]  # Shape: [batch_size, hidden_dim]
+                else:
+                    # Already using CPU
+                    tensor = tensor.to(self.device)
+                    with torch.no_grad():
+                        output = self.model(tensor)
+                        features = output[1]
+            except RuntimeError as e:
+                if "CUDA" in str(e):
+                    print(f"CUDA error during inference, falling back to CPU: {e}")
+                    # Try again on CPU
+                    self.device = torch.device('cpu')
+                    self.model = self.model.to(self.device)
+                    tensor = tensor.to(self.device)
+                    with torch.no_grad():
+                        output = self.model(tensor)
+                        features = output[1]
+                else:
+                    raise e
                 
             # Return as numpy array
             return features.cpu().numpy().flatten()
         except Exception as e:
             print(f"Error extracting features: {e}")
-            return np.zeros(512)  # Return zeros with expected feature dimension
+            return np.zeros(self.feature_dim)  # Return zeros with expected feature dimension
     
     def extract_pose_features(self, image, box):
         """
@@ -349,9 +397,38 @@ class DeepPersonReID:
     def load_features(self, filename="deep_person_features.pkl"):
         """Load person features from file"""
         if os.path.exists(filename):
-            with open(filename, 'rb') as f:
-                data = pickle.load(f)
-                self.person_features = data['person_features']
-                self.id_mapping = data['id_mapping']
-                self.next_persistent_id = data['next_persistent_id']
-            print(f"Loaded {len(self.person_features)} person profiles from {filename}") 
+            try:
+                with open(filename, 'rb') as f:
+                    data = pickle.load(f)
+                    
+                    # Check if features have compatible dimensions
+                    if data['person_features']:
+                        # Get first feature vector to check dimensions
+                        first_id = next(iter(data['person_features']))
+                        feature_dim = data['person_features'][first_id]['appearance'].shape[0]
+                        
+                        # If dimensions match, load the data
+                        if feature_dim == self.feature_dim:
+                            self.person_features = data['person_features']
+                            self.id_mapping = data['id_mapping']
+                            self.next_persistent_id = data['next_persistent_id']
+                            print(f"Loaded {len(self.person_features)} person profiles from {filename}")
+                        else:
+                            print(f"Feature dimensions mismatch: expected {self.feature_dim}, got {feature_dim}")
+                            print("Starting with empty features due to model change")
+                            # Start fresh with new feature dimensions
+                            self.person_features = {}
+                            self.id_mapping = {}
+                            self.next_persistent_id = 1
+                    else:
+                        # No features found, start fresh
+                        self.person_features = {}
+                        self.id_mapping = {}
+                        self.next_persistent_id = 1
+                        print(f"No valid features found in {filename}, starting fresh")
+            except Exception as e:
+                print(f"Error loading features: {e}")
+                print("Starting with empty features")
+                self.person_features = {}
+                self.id_mapping = {}
+                self.next_persistent_id = 1 
